@@ -1,0 +1,4 @@
+pyaudio
+websockets
+python-dotenv
+fish-audio-sdk
