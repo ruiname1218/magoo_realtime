@@ -1,6 +1,7 @@
 [Unit]
 Description=Magoo Realtime Audio Assistant
-After=network.target sound.target pigpiod.service pulseaudio.service
+After=network-online.target sound.target pigpiod.service pulseaudio.service
+Wants=network-online.target
 Requires=pigpiod.service
 
 [Service]
@@ -11,12 +12,30 @@ Environment="PATH=/home/rui/magoo_Lv100/magoo_realtime/venv/bin:/usr/local/sbin:
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
 Environment="PULSE_RUNTIME_PATH=/run/user/1000/pulse"
 Environment="DISPLAY=:0"
-ExecStartPre=/bin/sleep 10
+
+# Wait for system to stabilize and USB audio devices to initialize
+ExecStartPre=/bin/sleep 15
+
+# Main process
 ExecStart=/home/rui/magoo_Lv100/magoo_realtime/venv/bin/python /home/rui/magoo_Lv100/magoo_realtime/realtime_audio.py
+
+# Auto-restart on all failures (crash, killed, non-zero exit, etc.)
 Restart=always
-RestartSec=10
+RestartSec=5
+
+# Prevent infinite restart loops: max 5 restarts in 60 seconds
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Graceful shutdown
+TimeoutStopSec=15
+KillMode=mixed
+KillSignal=SIGINT
+
+# Logging
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=magoo
 
 [Install]
 WantedBy=multi-user.target

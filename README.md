@@ -12,6 +12,9 @@ A real-time voice AI assistant that uses OpenAI's Realtime API for speech-to-tex
 - **Servo Control**: GPIO-based servo movement synchronized with audio input (Raspberry Pi)
 - **Auto Sample Rate Detection**: Automatically detects and adapts to supported audio device sample rates
 - **Auto-Start on Boot**: Systemd service for running on Raspberry Pi startup
+- **Automatic Crash Recovery**: Multi-layer restart system handles network failures, crashes, and system errors
+- **Smart Microphone Detection**: Waits up to 30 seconds for USB audio devices to initialize on boot
+- **Audio-Only Mode**: Configured for voice-only interaction (no image input)
 
 ## Requirements
 
@@ -135,11 +138,14 @@ sudo systemctl stop magoo.service
 sudo systemctl disable magoo.service
 ```
 
-**Note:** The service automatically:
-- Waits 10 seconds after boot for audio system initialization
+**Service Features:**
+- Waits 15 seconds after boot for USB audio devices to initialize
+- Waits up to 30 seconds for microphone to be detected (Python-level)
 - Uses ALSA for direct audio device access
-- Restarts automatically if it crashes
-- Logs all output to systemd journal
+- Auto-restarts on crashes (5 attempts in 60 seconds max)
+- Auto-restarts on network failures (Python reconnection + systemd restart)
+- Graceful shutdown with 15-second timeout
+- Logs all output to systemd journal with identifier "magoo"
 
 ## How It Works
 
@@ -153,27 +159,38 @@ Microphone → OpenAI Realtime API → Text Response → Fish Audio TTS → Spea
 
 ### Key Components
 
-1. **Audio Capture** (`send_audio`):
+1. **Audio Initialization** (`_wait_for_audio_device`, `_detect_sample_rate`):
+   - Waits up to 30 seconds for microphone to appear
    - Auto-detects supported sample rate (24kHz, 48kHz, 44.1kHz, etc.)
+   - Displays detected microphone device name
+
+2. **Audio Capture** (`send_audio`):
    - Resamples to 24kHz PCM16 for OpenAI Realtime API if needed
-   - Sends to OpenAI Realtime API via WebSocket
+   - Sends to OpenAI Realtime API via WebSocket (audio-only, no image input)
    - Automatically sends silence when muted
 
-2. **Response Processing** (`receive_responses`):
+3. **Response Processing** (`receive_responses`):
    - Receives events from OpenAI API
    - Extracts transcriptions and AI responses
+   - Cleans response text (removes JSON artifacts)
    - Queues text for TTS processing
 
-3. **Text-to-Speech** (`process_single_response`):
+4. **Text-to-Speech** (`process_single_response`):
    - Mutes microphone before speaking
    - Streams audio chunks from Fish Audio
    - Plays audio through mpv using ALSA (falls back to mpg123 if mpv unavailable)
    - Unmutes microphone after completion
 
-4. **Connection Management** (`keepalive_ping`):
+5. **Connection Management** (`keepalive_ping`, `connect`):
    - Sends WebSocket pings every 10 seconds
-   - Detects connection failures
+   - Auto-reconnects on connection loss with exponential backoff
    - Handles timeouts gracefully
+
+6. **Crash Recovery** (`run`):
+   - Catches all unhandled exceptions
+   - Restarts entire session up to 10 times
+   - Cleans up resources before restart
+   - Works with systemd for process-level recovery
 
 ### Microphone Muting
 
@@ -191,19 +208,27 @@ This prevents the assistant from hearing its own voice and creating a feedback l
 Edit these values in `realtime_audio.py`:
 
 ```python
-# Audio configuration
+# Audio configuration (lines 24-28)
 CHUNK = 1024          # Audio buffer size
-RATE = 24000          # Sample rate (24kHz required by OpenAI)
+TARGET_RATE = 24000   # Sample rate for OpenAI (24kHz required)
+DEVICE_RATE = 48000   # Auto-detected from your microphone
 CHANNELS = 1          # Mono audio
 
-# Session configuration (line 65-79)
+# Session configuration (lines 121-139)
+"modalities": ["text"],        # Text-only output (no audio from OpenAI)
 "threshold": 0.5,              # VAD sensitivity (0.0-1.0)
 "silence_duration_ms": 500     # Silence before end of speech
 
-# TTS configuration (line 176-180)
+# TTS configuration (lines 339-343)
 format="mp3",                  # Audio format
 latency="balanced",            # balanced/normal
 chunk_length=150               # Characters per chunk
+
+# Microphone detection (line 70)
+max_wait=30                    # Seconds to wait for microphone on boot
+
+# Crash recovery (line 572)
+max_restarts=10                # Maximum restart attempts
 ```
 
 ## Troubleshooting
@@ -220,13 +245,32 @@ Install mpv: `sudo apt-get install mpv` or the system will fall back to mpg123.
 - The system auto-reconnects on failure
 
 ### Microphone not detected
+
+The system automatically waits up to 30 seconds for the microphone to be detected. If you still have issues:
+
 ```bash
 # Test microphone
 arecord -l
 
 # Test PyAudio
 python -c "import pyaudio; p=pyaudio.PyAudio(); print(p.get_device_count())"
+
+# Check service logs to see microphone detection
+sudo journalctl -u magoo -n 50 | grep AUDIO
 ```
+
+You should see:
+```
+[AUDIO] Waiting for microphone to become available...
+[AUDIO] Microphone found: <device name>
+[AUDIO] Detected supported sample rate: 48000 Hz
+```
+
+If the microphone is never found:
+- Ensure USB audio device is properly connected
+- Try a different USB port
+- Check if device appears with `lsusb`
+- The service will auto-restart up to 5 times to retry detection
 
 ### "OSError: [Errno -9999] Unanticipated host error" or "Invalid sample rate" (Raspberry Pi)
 The application automatically detects supported sample rates and uses ALSA for audio playback. If you encounter issues:
@@ -264,6 +308,45 @@ The application automatically detects supported sample rates and uses ALSA for a
    ```bash
    sudo systemctl enable pigpiod
    ```
+
+### Service crashes or stops unexpectedly
+
+The system has multi-layer automatic crash recovery:
+
+**Python-level recovery:**
+- Automatically reconnects WebSocket on connection loss
+- Retries up to 10 times with exponential backoff (max 5 minutes between attempts)
+- Restarts entire session on critical errors
+
+**Systemd-level recovery:**
+- Restarts process automatically on crashes
+- Maximum 5 restart attempts within 60 seconds
+- Waits 5 seconds between restart attempts
+
+**To check what happened:**
+```bash
+# View recent logs
+sudo journalctl -u magoo -n 200
+
+# View live logs
+sudo journalctl -u magoo -f
+
+# Check service status
+sudo systemctl status magoo
+```
+
+**If service is stopped after multiple crashes:**
+```bash
+# Reset failure counter and restart
+sudo systemctl reset-failed magoo
+sudo systemctl restart magoo
+```
+
+**Common error patterns in logs:**
+- `[WebSocket] Connection failed` - Network issues, auto-retries
+- `[TTS ERROR] No audio chunks` - Fish Audio API issue
+- `[AUDIO ERROR] Microphone not found` - USB audio device not ready
+- `[CRITICAL ERROR]` - Unhandled exception, systemd will restart
 
 ## Development
 

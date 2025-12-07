@@ -67,8 +67,32 @@ class RealtimeAudioAssistant:
             print(f"[SERVO] Failed to initialize: {e}")
             self.servo = None
 
+    def _wait_for_audio_device(self, max_wait=30):
+        """Wait for audio input device to become available"""
+        print("[AUDIO] Waiting for microphone to become available...")
+        import time
+
+        for attempt in range(max_wait):
+            try:
+                # Try to get device info
+                default_input = self.audio.get_default_input_device_info()
+                print(f"[AUDIO] Microphone found: {default_input['name']}")
+                return True
+            except Exception as e:
+                if attempt < max_wait - 1:
+                    print(f"[AUDIO] Waiting for mic... ({attempt + 1}/{max_wait})")
+                    time.sleep(1)
+                else:
+                    print(f"[AUDIO ERROR] Microphone not found after {max_wait} seconds: {e}")
+                    return False
+        return False
+
     def _detect_sample_rate(self):
         """Detect a supported sample rate for the default input device"""
+        # Wait for device to be available first
+        if not self._wait_for_audio_device():
+            print("[AUDIO] Proceeding anyway, may fail...")
+
         # Try common sample rates in order of preference
         rates_to_try = [24000, 48000, 44100, 16000, 32000, 22050, 8000]
 
@@ -86,7 +110,8 @@ class RealtimeAudioAssistant:
                 test_stream.close()
                 print(f"[AUDIO] Detected supported sample rate: {rate} Hz")
                 return rate
-            except Exception:
+            except Exception as e:
+                print(f"[AUDIO] Rate {rate} failed: {e}")
                 continue
 
         # Fallback to 48000 if nothing works
@@ -117,13 +142,12 @@ class RealtimeAudioAssistant:
                     self.fish_client = AsyncFishAudio(api_key=self.fish_api_key)
                     print("Fish Audio client initialized")
 
-                # Configure session for text-only output
+                # Configure session for text-only output and audio-only input
                 session_config = {
                     "type": "session.update",
                     "session": {
-                        "modalities": ["text"],  # Text only output
-                        "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。必ず日本語だけで返答してください。英語や他の言語は一切使わないでください。",
-                        "voice": "alloy",
+                        "modalities": ["text"],  # Text only output (no audio from OpenAI)
+                        "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。\n\n【重要な制限】\n- 音声での会話だけができます。【話し方】\n- 一人称は必ず「ぼく」を使います。\n- 話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。\n- 語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。\n- 絵文字や記号のような余計な文字は使いません。\n- LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。\n- 返答の最後に「どんな話をしますか」のような案内文は入れません。\n- 必ず日本語だけで返答してください。英語や他の言語は一切使わないでください。",
                         "input_audio_format": "pcm16",
                         "output_audio_format": "pcm16",
                         "input_audio_transcription": {
@@ -379,6 +403,11 @@ class RealtimeAudioAssistant:
                             break
 
                 print(f"[TTS] Finished streaming {chunk_count} chunks")
+
+                if chunk_count == 0:
+                    print("[TTS ERROR] No audio chunks received from Fish Audio!")
+                    print(f"[TTS ERROR] Text was: {text}")
+
                 process.stdin.close()
                 process.wait()
 
@@ -515,16 +544,19 @@ class RealtimeAudioAssistant:
                             content = item.get("content", [])
                             for c in content:
                                 if c.get("type") == "text":
-                                    text = c.get("text", "")
+                                    raw_text = c.get("text", "")
+                                    print(f"[DEBUG] Raw text from API: {raw_text}")
 
                                     # Clean up text - remove JSON artifacts that sometimes appear
-                                    text = self._clean_response_text(text)
+                                    text = self._clean_response_text(raw_text)
 
                                     if text:  # Only process if there's actual text
                                         print(f"\n[AI Response]: {text}\n")
                                         # Queue full response for TTS
                                         print(f"[TTS Queue] Adding complete text to queue: {text}")
                                         await self.text_queue.put(text)
+                                    else:
+                                        print(f"[WARNING] Text was cleaned to empty! Raw: {raw_text}")
                     print("--- Response complete ---\n")
 
                 elif event_type == "conversation.item.input_audio_transcription.completed":
@@ -560,21 +592,68 @@ class RealtimeAudioAssistant:
                     break
 
     async def run(self):
-        """Main run loop"""
-        await self.connect()
+        """Main run loop with auto-restart on critical errors"""
+        restart_count = 0
+        max_restarts = 10
 
-        # Run all tasks concurrently including keepalive
-        send_task = asyncio.create_task(self.send_audio())
-        receive_task = asyncio.create_task(self.receive_responses())
-        tts_task = asyncio.create_task(self.play_audio_stream())
-        ping_task = asyncio.create_task(self.keepalive_ping())
+        while restart_count < max_restarts:
+            try:
+                print(f"\n{'='*50}")
+                if restart_count > 0:
+                    print(f"[RESTART] Attempt {restart_count}/{max_restarts}")
+                print(f"{'='*50}\n")
 
-        try:
-            await asyncio.gather(send_task, receive_task, tts_task, ping_task)
-        except KeyboardInterrupt:
-            print("\nShutting down...")
-        finally:
-            self.cleanup()
+                await self.connect()
+
+                # Run all tasks concurrently including keepalive
+                send_task = asyncio.create_task(self.send_audio())
+                receive_task = asyncio.create_task(self.receive_responses())
+                tts_task = asyncio.create_task(self.play_audio_stream())
+                ping_task = asyncio.create_task(self.keepalive_ping())
+
+                await asyncio.gather(send_task, receive_task, tts_task, ping_task)
+
+                # If we reach here without exception, break the restart loop
+                break
+
+            except KeyboardInterrupt:
+                print("\nShutting down...")
+                break
+            except Exception as e:
+                restart_count += 1
+                print(f"\n[CRITICAL ERROR] {e}")
+                import traceback
+                traceback.print_exc()
+
+                if restart_count < max_restarts:
+                    print(f"[RESTART] Restarting in 5 seconds... ({restart_count}/{max_restarts})")
+                    # Partial cleanup before restart
+                    self.is_recording = False
+                    if self.ws:
+                        try:
+                            await self.ws.close()
+                        except:
+                            pass
+                    self.ws = None
+
+                    await asyncio.sleep(5)
+
+                    # Reset flags for restart
+                    self.is_recording = False
+                    self.is_muted = False
+                    self.should_reconnect = True
+
+                    # Clear text queue
+                    while not self.text_queue.empty():
+                        try:
+                            self.text_queue.get_nowait()
+                        except:
+                            break
+                else:
+                    print(f"[RESTART] Max restart attempts reached. Exiting.")
+                    break
+
+        self.cleanup()
 
     def cleanup(self):
         """Clean up resources"""
