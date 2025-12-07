@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import pyaudio
+import re
 import websockets
 from typing import Optional
 from dotenv import load_dotenv
@@ -77,7 +78,7 @@ class RealtimeAudioAssistant:
                     "type": "session.update",
                     "session": {
                         "modalities": ["text"],  # Text only output
-                        "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号、text:のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。危ないお願いには、少し困った感じでやさしく断って、大人に相談するように伝えてください。",
+                        "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。",
                         "voice": "alloy",
                         "input_audio_format": "pcm16",
                         "output_audio_format": "pcm16",
@@ -120,6 +121,38 @@ class RealtimeAudioAssistant:
         self.is_muted = False
         if self.stream and not self.stream.is_active():
             self.stream.start_stream()
+
+    def _clean_response_text(self, text: str) -> str:
+        """Clean response text by removing JSON artifacts and metadata"""
+        if not text:
+            return ""
+
+        # Pattern 1: Remove leading JSON-like metadata (role, content, etc.)
+        # Matches: "role":"assistant","content": or text: or similar patterns
+        text = re.sub(r'^[\s]*("role"\s*:\s*"assistant"\s*,\s*"content"\s*:\s*|text\s*:\s*)+', '', text, flags=re.IGNORECASE)
+
+        # Pattern 2: If text starts with a quote and JSON structure, try to extract the actual content
+        try:
+            # Try parsing as JSON in case the whole thing is JSON
+            parsed = json.loads(text)
+            # Check for common fields that contain the actual message
+            if isinstance(parsed, dict):
+                if "message" in parsed:
+                    return parsed["message"]
+                elif "content" in parsed:
+                    return parsed["content"]
+                elif "text" in parsed:
+                    return parsed["text"]
+        except (json.JSONDecodeError, ValueError):
+            pass  # Not JSON, continue with regex cleaning
+
+        # Pattern 3: Remove trailing JSON artifacts
+        text = re.sub(r'[\s]*[,\}]+\s*$', '', text)
+
+        # Clean up extra whitespace
+        text = text.strip()
+
+        return text
 
     async def keepalive_ping(self):
         """Send periodic pings to keep WebSocket alive"""
@@ -368,21 +401,15 @@ class RealtimeAudioAssistant:
                             for c in content:
                                 if c.get("type") == "text":
                                     text = c.get("text", "")
-                                    print(f"\n[AI Response]: {text}\n")
 
-                                    # Parse JSON if the response is in JSON format
-                                    try:
-                                        import json as json_lib
-                                        parsed = json_lib.loads(text)
-                                        if "message" in parsed:
-                                            text = parsed["message"]
-                                            print(f"[Extracted message]: {text}")
-                                    except:
-                                        pass  # Not JSON, use as-is
+                                    # Clean up text - remove JSON artifacts that sometimes appear
+                                    text = self._clean_response_text(text)
 
-                                    # Queue full response for TTS if we didn't get deltas
-                                    print(f"[TTS Queue] Adding complete text to queue: {text}")
-                                    await self.text_queue.put(text)
+                                    if text:  # Only process if there's actual text
+                                        print(f"\n[AI Response]: {text}\n")
+                                        # Queue full response for TTS
+                                        print(f"[TTS Queue] Adding complete text to queue: {text}")
+                                        await self.text_queue.put(text)
                     print("--- Response complete ---\n")
 
                 elif event_type == "conversation.item.input_audio_transcription.completed":
