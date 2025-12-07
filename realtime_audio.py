@@ -24,7 +24,7 @@ RATE = 24000  # 24kHz for OpenAI Realtime API
 
 
 class RealtimeAudioAssistant:
-    def __init__(self, api_key: Optional[str] = None, fish_api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, fish_api_key: Optional[str] = None, fish_voice_id: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
@@ -32,6 +32,10 @@ class RealtimeAudioAssistant:
         self.fish_api_key = fish_api_key or os.getenv("FISH_API_KEY")
         if not self.fish_api_key:
             raise ValueError("Fish Audio API key not found. Set FISH_API_KEY environment variable.")
+
+        self.fish_voice_id = fish_voice_id or os.getenv("FISH_VOICE_ID")
+        if not self.fish_voice_id:
+            raise ValueError("Fish Audio Voice ID not found. Set FISH_VOICE_ID environment variable.")
 
         self.audio = pyaudio.PyAudio()
         self.stream = None
@@ -67,7 +71,7 @@ class RealtimeAudioAssistant:
             "type": "session.update",
             "session": {
                 "modalities": ["text"],  # Text only output
-                "instructions": "You are a helpful AI companion robot assistant.",
+                "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号、text:のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。危ないお願いには、少し困った感じでやさしく断って、大人に相談するように伝えてください。",
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
@@ -194,6 +198,7 @@ class RealtimeAudioAssistant:
             # Stream to Fish Audio
             audio_stream = self.fish_client.tts.stream_websocket(
                 single_text_generator(),
+                reference_id=self.fish_voice_id,
                 config=tts_config
             )
 
@@ -234,6 +239,7 @@ class RealtimeAudioAssistant:
             try:
                 audio_stream = self.fish_client.tts.stream_websocket(
                     single_text_generator(),
+                    reference_id=self.fish_voice_id,
                     config=TTSConfig(format="mp3", latency="balanced", chunk_length=150)
                 )
 
@@ -294,7 +300,7 @@ class RealtimeAudioAssistant:
         try:
             while self.is_recording and self.ws:
                 try:
-                    message = await asyncio.wait_for(self.ws.recv(), timeout=60.0)
+                    message = await asyncio.wait_for(self.ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
                     print("[WebSocket] No message received for 60s, continuing...")
                     continue
