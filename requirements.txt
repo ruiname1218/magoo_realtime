@@ -2,3 +2,5 @@ pyaudio
 websockets
 python-dotenv
 fish-audio-sdk
+gpiozero
+pigpio

@@ -9,25 +9,31 @@ A real-time voice AI assistant that uses OpenAI's Realtime API for speech-to-tex
 - **Smart Microphone Muting**: Automatically mutes microphone during TTS playback to prevent audio feedback
 - **WebSocket Keepalive**: Maintains stable long-running connections with automatic ping/pong
 - **Streaming Audio Playback**: Real-time audio streaming using mpv for low-latency responses
+- **Servo Control**: GPIO-based servo movement synchronized with audio input (Raspberry Pi)
 
 ## Requirements
 
 - Python 3.8+
 - PyAudio (requires PortAudio system library)
 - mpv or mpg123 (for audio playback)
+- gpiozero and pigpio (for servo control on Raspberry Pi)
 
 ### System Dependencies
 
 **Raspberry Pi / Debian / Ubuntu:**
 ```bash
 sudo apt-get update
-sudo apt-get install python3-pyaudio portaudio19-dev mpv
+sudo apt-get install python3-pyaudio portaudio19-dev mpv pigpio
+sudo systemctl enable pigpiod
+sudo systemctl start pigpiod
 ```
 
 **macOS:**
 ```bash
 brew install portaudio mpv
 ```
+
+Note: GPIO features are Raspberry Pi only.
 
 ## Installation
 
@@ -57,10 +63,12 @@ brew install portaudio mpv
    ```
    OPENAI_API_KEY=your_openai_api_key_here
    FISH_API_KEY=your_fish_audio_api_key_here
+   FISH_VOICE_ID=your_fish_voice_id_here
    ```
 
    - Get OpenAI API key: https://platform.openai.com/api-keys
    - Get Fish Audio API key: https://fish.audio/
+   - Get Fish Voice ID from your Fish Audio dashboard
 
 ## Usage
 
@@ -164,6 +172,43 @@ arecord -l
 # Test PyAudio
 python -c "import pyaudio; p=pyaudio.PyAudio(); print(p.get_device_count())"
 ```
+
+### "OSError: [Errno -9999] Unanticipated host error" (Raspberry Pi)
+This usually means the audio system can't initialize. Try:
+
+1. **Check if PulseAudio is running:**
+   ```bash
+   pulseaudio --check && echo "Running" || echo "Not running"
+   ```
+
+2. **Start PulseAudio if needed:**
+   ```bash
+   pulseaudio --start
+   ```
+
+3. **Or use ALSA directly** by setting the device index in the code
+
+4. **Verify audio device is accessible:**
+   ```bash
+   arecord -l  # List capture devices
+   aplay -l    # List playback devices
+   ```
+
+### Servo not working (Raspberry Pi)
+1. **Check pigpio daemon is running:**
+   ```bash
+   sudo systemctl status pigpiod
+   ```
+
+2. **Start pigpio daemon:**
+   ```bash
+   sudo systemctl start pigpiod
+   ```
+
+3. **Enable pigpio daemon on boot:**
+   ```bash
+   sudo systemctl enable pigpiod
+   ```
 
 ## Development
 
