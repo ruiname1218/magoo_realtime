@@ -13,6 +13,8 @@ from fishaudio.utils import play
 from queue import Queue
 import threading
 import io
+from gpiozero import Servo
+from gpiozero.pins.pigpio import PiGPIOFactory
 
 # Load environment variables from .env file
 load_dotenv()
@@ -49,6 +51,16 @@ class RealtimeAudioAssistant:
         self.should_reconnect = True  # Flag to control reconnection
         self.max_reconnect_delay = 300  # Max 5 minutes between reconnection attempts
 
+        # Initialize servo on GPIO17
+        try:
+            factory = PiGPIOFactory()
+            self.servo = Servo(17, pin_factory=factory)
+            self.servo.mid()  # Center position
+            print("[SERVO] Initialized on GPIO17")
+        except Exception as e:
+            print(f"[SERVO] Failed to initialize: {e}")
+            self.servo = None
+
     async def connect(self):
         """Connect to OpenAI Realtime API with automatic reconnection"""
         retry_count = 0
@@ -78,12 +90,13 @@ class RealtimeAudioAssistant:
                     "type": "session.update",
                     "session": {
                         "modalities": ["text"],  # Text only output
-                        "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。",
+                        "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。必ず日本語だけで返答してください。英語や他の言語は一切使わないでください。",
                         "voice": "alloy",
                         "input_audio_format": "pcm16",
                         "output_audio_format": "pcm16",
                         "input_audio_transcription": {
-                            "model": "whisper-1"
+                            "model": "whisper-1",
+                            "language": "ja"
                         },
                         "turn_detection": {
                             "type": "server_vad",
@@ -122,6 +135,21 @@ class RealtimeAudioAssistant:
         if self.stream and not self.stream.is_active():
             self.stream.start_stream()
 
+    async def move_servo_on_audio(self):
+        """Move servo -90 degrees, wait 0.3s, then +90 degrees"""
+        if not self.servo:
+            print("[SERVO] Servo not available, skipping movement")
+            return
+
+        try:
+            print("[SERVO] Moving -90 degrees")
+            self.servo.min()  # Move to minimum position (-90 degrees)
+            await asyncio.sleep(0.6)
+            print("[SERVO] Moving +90 degrees")
+            self.servo.max()  # Move to maximum position (+90 degrees)
+        except Exception as e:
+            print(f"[SERVO] Movement error: {e}")
+
     def _clean_response_text(self, text: str) -> str:
         """Clean response text by removing JSON artifacts and metadata"""
         if not text:
@@ -132,8 +160,8 @@ class RealtimeAudioAssistant:
         text = re.sub(r'^[\s]*("role"\s*:\s*"assistant"\s*,\s*"content"\s*:\s*|text\s*:\s*|response"\s*:\s*|input_type"\s*:\s*"[^"]+"\s*,\s*"confidence"\s*:\s*[\d.]+\s*\})+', '', text, flags=re.IGNORECASE)
 
         # Pattern 1b: Remove other common JSON metadata patterns at the start
-        # Matches: "input_type": or "response": or similar field names followed by values
-        text = re.sub(r'^[\s]*"?[a-z_]+"\s*:\s*', '', text, flags=re.IGNORECASE)
+        # Matches: "input_type": or "response": or "Answer:" or similar field names followed by values
+        text = re.sub(r'^[\s]*"?(?:answer|[a-z_]+)"\s*:\s*', '', text, flags=re.IGNORECASE)
 
         # Pattern 2: If text starts with a quote and JSON structure, try to extract the actual content
         try:
@@ -155,6 +183,10 @@ class RealtimeAudioAssistant:
 
         # Pattern 4: Remove leading braces/brackets
         text = re.sub(r'^[\s]*[\{\[]+\s*', '', text)
+
+        # Pattern 5: Remove leading English words/phrases and strange symbols before Japanese text
+        # This removes any ASCII letters, numbers, and common symbols before the first Japanese character
+        text = re.sub(r'^[A-Za-z0-9\s\:\.\,\!\?\-\_\'\"\#\$\%\&\*\+\=\@\^\`\|\~\(\)\[\]\{\}\<\>\/\\]+(?=[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF])', '', text)
 
         # Clean up extra whitespace
         text = text.strip()
@@ -423,6 +455,8 @@ class RealtimeAudioAssistant:
                     # User's speech transcription
                     transcript = data.get("transcript", "")
                     print(f"\n[You said]: {transcript}\n")
+                    # Trigger servo movement when audio is detected
+                    asyncio.create_task(self.move_servo_on_audio())
 
                 elif event_type == "error":
                     error = data.get("error", {})
@@ -483,6 +517,10 @@ class RealtimeAudioAssistant:
 
         if self.audio:
             self.audio.terminate()
+
+        if self.servo:
+            self.servo.close()
+            print("[SERVO] Closed")
 
         # Signal TTS to stop
         try:
