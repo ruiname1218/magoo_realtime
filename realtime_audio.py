@@ -127,9 +127,13 @@ class RealtimeAudioAssistant:
         if not text:
             return ""
 
-        # Pattern 1: Remove leading JSON-like metadata (role, content, etc.)
-        # Matches: "role":"assistant","content": or text: or similar patterns
-        text = re.sub(r'^[\s]*("role"\s*:\s*"assistant"\s*,\s*"content"\s*:\s*|text\s*:\s*)+', '', text, flags=re.IGNORECASE)
+        # Pattern 1: Remove leading JSON-like metadata (role, content, input_type, response, etc.)
+        # Matches patterns like: "role":"assistant","content": or text: or input_type":"voice","confidence":1.0} or response":
+        text = re.sub(r'^[\s]*("role"\s*:\s*"assistant"\s*,\s*"content"\s*:\s*|text\s*:\s*|response"\s*:\s*|input_type"\s*:\s*"[^"]+"\s*,\s*"confidence"\s*:\s*[\d.]+\s*\})+', '', text, flags=re.IGNORECASE)
+
+        # Pattern 1b: Remove other common JSON metadata patterns at the start
+        # Matches: "input_type": or "response": or similar field names followed by values
+        text = re.sub(r'^[\s]*"?[a-z_]+"\s*:\s*', '', text, flags=re.IGNORECASE)
 
         # Pattern 2: If text starts with a quote and JSON structure, try to extract the actual content
         try:
@@ -146,8 +150,11 @@ class RealtimeAudioAssistant:
         except (json.JSONDecodeError, ValueError):
             pass  # Not JSON, continue with regex cleaning
 
-        # Pattern 3: Remove trailing JSON artifacts
-        text = re.sub(r'[\s]*[,\}]+\s*$', '', text)
+        # Pattern 3: Remove trailing JSON artifacts (commas, braces, brackets)
+        text = re.sub(r'[\s]*[,\}\]]+\s*$', '', text)
+
+        # Pattern 4: Remove leading braces/brackets
+        text = re.sub(r'^[\s]*[\{\[]+\s*', '', text)
 
         # Clean up extra whitespace
         text = text.strip()
