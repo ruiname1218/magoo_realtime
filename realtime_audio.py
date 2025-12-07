@@ -45,50 +45,67 @@ class RealtimeAudioAssistant:
         self.fish_client = None
         self.text_queue = asyncio.Queue()
         self.current_text_buffer = ""
+        self.should_reconnect = True  # Flag to control reconnection
+        self.max_reconnect_delay = 300  # Max 5 minutes between reconnection attempts
 
     async def connect(self):
-        """Connect to OpenAI Realtime API"""
+        """Connect to OpenAI Realtime API with automatic reconnection"""
+        retry_count = 0
         url = "wss://api.openai.com/v1/realtime?model=gpt-realtime-mini-2025-10-06"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "OpenAI-Beta": "realtime=v1"
         }
 
-        self.ws = await websockets.connect(
-            url,
-            additional_headers=headers,
-            ping_interval=None,  # Disable auto-ping, we'll handle it manually
-            close_timeout=10
-        )
-        print("Connected to OpenAI Realtime API")
+        while self.should_reconnect:
+            try:
+                self.ws = await websockets.connect(
+                    url,
+                    additional_headers=headers,
+                    ping_interval=None,  # Disable auto-ping, we'll handle it manually
+                    close_timeout=10
+                )
+                print("Connected to OpenAI Realtime API")
 
-        # Initialize Fish Audio client
-        self.fish_client = AsyncFishAudio(api_key=self.fish_api_key)
-        print("Fish Audio client initialized")
+                # Initialize Fish Audio client
+                if not self.fish_client:
+                    self.fish_client = AsyncFishAudio(api_key=self.fish_api_key)
+                    print("Fish Audio client initialized")
 
-        # Configure session for text-only output
-        session_config = {
-            "type": "session.update",
-            "session": {
-                "modalities": ["text"],  # Text only output
-                "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号、text:のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。危ないお願いには、少し困った感じでやさしく断って、大人に相談するように伝えてください。",
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
+                # Configure session for text-only output
+                session_config = {
+                    "type": "session.update",
+                    "session": {
+                        "modalities": ["text"],  # Text only output
+                        "instructions": "あなたは「マゴー」という名前の8歳のAIコンパニオンロボットです。一人称は必ず「ぼく」を使います。話し方は甘くてやさしい8歳らしく、短めの言葉で素直に話してください。語尾には「〜だよ」「〜なの」「〜なんだ」などの子どもらしい柔らかい言い方を使います。絵文字や記号、text:のような余計な文字は使いません。LLMっぽい堅い言い方や説明口調は避け、自然な子どもの会話だけにしてください。返答の最後に「どんな話をしますか」のような案内文は入れません。危ないお願いには、少し困った感じでやさしく断って、大人に相談するように伝えてください。",
+                        "voice": "alloy",
+                        "input_audio_format": "pcm16",
+                        "output_audio_format": "pcm16",
+                        "input_audio_transcription": {
+                            "model": "whisper-1"
+                        },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500
+                        }
+                    }
                 }
-            }
-        }
 
-        await self.ws.send(json.dumps(session_config))
-        print("Session configured for text-only responses")
+                await self.ws.send(json.dumps(session_config))
+                print("Session configured for text-only responses")
+
+                # Reset retry count on successful connection
+                retry_count = 0
+                return  # Successfully connected
+
+            except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
+                retry_count += 1
+                delay = min(2 ** retry_count, self.max_reconnect_delay)
+                print(f"[WebSocket] Connection failed: {e}")
+                print(f"[WebSocket] Retrying in {delay} seconds (attempt {retry_count})...")
+                await asyncio.sleep(delay)
 
     def mute_microphone(self):
         """Physically mute microphone by stopping the stream"""
@@ -163,9 +180,19 @@ class RealtimeAudioAssistant:
                 if self.ws:
                     try:
                         await self.ws.send(json.dumps(message))
-                    except Exception as e:
+                    except (websockets.exceptions.ConnectionClosed, Exception) as e:
                         print(f"[WebSocket] Send failed: {e}")
-                        break
+                        if self.should_reconnect:
+                            print("[WebSocket] Connection lost during send, waiting for reconnection...")
+                            await asyncio.sleep(1)
+                            continue
+                        else:
+                            break
+                else:
+                    # Wait for reconnection
+                    await asyncio.sleep(0.1)
+                    continue
+
                 await asyncio.sleep(0.01)
 
         except KeyboardInterrupt:
@@ -296,14 +323,22 @@ class RealtimeAudioAssistant:
             print(f"[ERROR] Traceback:\n{traceback.format_exc()}")
 
     async def receive_responses(self):
-        """Receive and process responses from the API"""
-        try:
-            while self.is_recording and self.ws:
+        """Receive and process responses from the API with automatic reconnection"""
+        while self.is_recording and self.should_reconnect:
+            try:
+                if not self.ws:
+                    print("[WebSocket] Connection lost, attempting to reconnect...")
+                    await self.connect()
+                    if not self.ws:
+                        await asyncio.sleep(5)
+                        continue
+
                 try:
                     message = await asyncio.wait_for(self.ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
                     print("[WebSocket] No message received for 60s, continuing...")
                     continue
+
                 data = json.loads(message)
                 event_type = data.get("type")
 
@@ -363,10 +398,22 @@ class RealtimeAudioAssistant:
                 if event_type in ["response.done", "conversation.item.created"]:
                     print(f"[DEBUG Full Data]: {json.dumps(data, indent=2)}\n")
 
-        except websockets.exceptions.ConnectionClosed:
-            print("Connection closed")
-        except Exception as e:
-            print(f"[WebSocket ERROR]: {e}")
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"[WebSocket] Connection closed: {e}")
+                self.ws = None  # Clear the connection
+                if self.should_reconnect:
+                    print("[WebSocket] Will attempt to reconnect...")
+                    await asyncio.sleep(1)
+                else:
+                    break
+            except Exception as e:
+                print(f"[WebSocket ERROR]: {e}")
+                self.ws = None  # Clear the connection
+                if self.should_reconnect:
+                    print("[WebSocket] Will attempt to reconnect after error...")
+                    await asyncio.sleep(5)
+                else:
+                    break
 
     async def run(self):
         """Main run loop"""
@@ -388,6 +435,13 @@ class RealtimeAudioAssistant:
     def cleanup(self):
         """Clean up resources"""
         self.is_recording = False
+        self.should_reconnect = False
+
+        if self.ws:
+            try:
+                asyncio.create_task(self.ws.close())
+            except (RuntimeError, Exception):
+                pass  # Loop may be closed or already closed
 
         if self.stream:
             self.stream.stop_stream()
