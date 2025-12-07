@@ -1,0 +1,22 @@
+[Unit]
+Description=Magoo Realtime Audio Assistant
+After=network.target sound.target pigpiod.service pulseaudio.service
+Requires=pigpiod.service
+
+[Service]
+Type=simple
+User=rui
+WorkingDirectory=/home/rui/magoo_Lv100/magoo_realtime
+Environment="PATH=/home/rui/magoo_Lv100/magoo_realtime/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="PULSE_RUNTIME_PATH=/run/user/1000/pulse"
+Environment="DISPLAY=:0"
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/rui/magoo_Lv100/magoo_realtime/venv/bin/python /home/rui/magoo_Lv100/magoo_realtime/realtime_audio.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

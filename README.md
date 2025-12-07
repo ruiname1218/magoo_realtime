@@ -8,8 +8,10 @@ A real-time voice AI assistant that uses OpenAI's Realtime API for speech-to-tex
 - **High-Quality TTS**: Fish Audio SDK for natural-sounding voice responses
 - **Smart Microphone Muting**: Automatically mutes microphone during TTS playback to prevent audio feedback
 - **WebSocket Keepalive**: Maintains stable long-running connections with automatic ping/pong
-- **Streaming Audio Playback**: Real-time audio streaming using mpv for low-latency responses
+- **Streaming Audio Playback**: Real-time audio streaming using mpv with ALSA for low-latency responses
 - **Servo Control**: GPIO-based servo movement synchronized with audio input (Raspberry Pi)
+- **Auto Sample Rate Detection**: Automatically detects and adapts to supported audio device sample rates
+- **Auto-Start on Boot**: Systemd service for running on Raspberry Pi startup
 
 ## Requirements
 
@@ -72,7 +74,9 @@ Note: GPIO features are Raspberry Pi only.
 
 ## Usage
 
-Run the assistant:
+### Manual Mode
+
+Run the assistant manually:
 ```bash
 python realtime_audio.py
 ```
@@ -87,6 +91,56 @@ The system will:
 
 **To stop:** Press `Ctrl+C`
 
+### Auto-Start on Boot (Raspberry Pi)
+
+To make Magoo start automatically when the Raspberry Pi powers on:
+
+1. **Copy the service file to systemd:**
+   ```bash
+   sudo cp magoo.service /etc/systemd/system/
+   ```
+
+2. **Reload systemd:**
+   ```bash
+   sudo systemctl daemon-reload
+   ```
+
+3. **Enable the service:**
+   ```bash
+   sudo systemctl enable magoo.service
+   ```
+
+4. **Start the service now:**
+   ```bash
+   sudo systemctl start magoo.service
+   ```
+
+5. **Check status:**
+   ```bash
+   sudo systemctl status magoo.service
+   ```
+
+6. **View logs:**
+   ```bash
+   sudo journalctl -u magoo.service -f
+   ```
+
+**To stop the service:**
+```bash
+sudo systemctl stop magoo.service
+```
+
+**To disable auto-start:**
+```bash
+sudo systemctl disable magoo.service
+```
+
+**Note:** The service automatically:
+- Waits 10 seconds after boot for audio system initialization
+- Uses ALSA for direct audio device access
+- Restarts automatically if it crashes
+- Logs all output to systemd journal
+
 ## How It Works
 
 ### Architecture
@@ -100,7 +154,8 @@ Microphone → OpenAI Realtime API → Text Response → Fish Audio TTS → Spea
 ### Key Components
 
 1. **Audio Capture** (`send_audio`):
-   - Captures audio at 24kHz PCM16 format
+   - Auto-detects supported sample rate (24kHz, 48kHz, 44.1kHz, etc.)
+   - Resamples to 24kHz PCM16 for OpenAI Realtime API if needed
    - Sends to OpenAI Realtime API via WebSocket
    - Automatically sends silence when muted
 
@@ -112,7 +167,7 @@ Microphone → OpenAI Realtime API → Text Response → Fish Audio TTS → Spea
 3. **Text-to-Speech** (`process_single_response`):
    - Mutes microphone before speaking
    - Streams audio chunks from Fish Audio
-   - Plays audio through mpv
+   - Plays audio through mpv using ALSA (falls back to mpg123 if mpv unavailable)
    - Unmutes microphone after completion
 
 4. **Connection Management** (`keepalive_ping`):
@@ -173,26 +228,26 @@ arecord -l
 python -c "import pyaudio; p=pyaudio.PyAudio(); print(p.get_device_count())"
 ```
 
-### "OSError: [Errno -9999] Unanticipated host error" (Raspberry Pi)
-This usually means the audio system can't initialize. Try:
+### "OSError: [Errno -9999] Unanticipated host error" or "Invalid sample rate" (Raspberry Pi)
+The application automatically detects supported sample rates and uses ALSA for audio playback. If you encounter issues:
 
-1. **Check if PulseAudio is running:**
-   ```bash
-   pulseaudio --check && echo "Running" || echo "Not running"
-   ```
-
-2. **Start PulseAudio if needed:**
-   ```bash
-   pulseaudio --start
-   ```
-
-3. **Or use ALSA directly** by setting the device index in the code
-
-4. **Verify audio device is accessible:**
+1. **Verify audio devices are accessible:**
    ```bash
    arecord -l  # List capture devices
    aplay -l    # List playback devices
    ```
+
+2. **Test audio playback:**
+   ```bash
+   speaker-test -t wav -c 2
+   ```
+
+3. **Check service logs for detected sample rate:**
+   ```bash
+   sudo journalctl -u magoo.service -f
+   ```
+
+   You should see: `[AUDIO] Detected supported sample rate: XXXXX Hz`
 
 ### Servo not working (Raspberry Pi)
 1. **Check pigpio daemon is running:**
@@ -217,6 +272,7 @@ This usually means the audio system can't initialize. Try:
 magoo_realtime/
 ├── realtime_audio.py      # Main application
 ├── requirements.txt       # Python dependencies
+├── magoo.service          # Systemd service for auto-start
 ├── .env                   # API keys (not in git)
 ├── .env.example          # Template for API keys
 ├── .gitignore            # Git ignore rules

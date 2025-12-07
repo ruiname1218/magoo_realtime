@@ -15,6 +15,7 @@ import threading
 import io
 from gpiozero import Servo
 from gpiozero.pins.pigpio import PiGPIOFactory
+import audioop
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,7 +24,8 @@ load_dotenv()
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = 24000  # 24kHz for OpenAI Realtime API
+TARGET_RATE = 24000  # 24kHz for OpenAI Realtime API
+DEVICE_RATE = 48000  # Will be auto-detected, fallback to 48kHz
 
 
 class RealtimeAudioAssistant:
@@ -51,6 +53,10 @@ class RealtimeAudioAssistant:
         self.should_reconnect = True  # Flag to control reconnection
         self.max_reconnect_delay = 300  # Max 5 minutes between reconnection attempts
 
+        # Detect supported sample rate
+        self.device_rate = self._detect_sample_rate()
+        print(f"[AUDIO] Using device sample rate: {self.device_rate} Hz")
+
         # Initialize servo on GPIO17
         try:
             factory = PiGPIOFactory()
@@ -60,6 +66,32 @@ class RealtimeAudioAssistant:
         except Exception as e:
             print(f"[SERVO] Failed to initialize: {e}")
             self.servo = None
+
+    def _detect_sample_rate(self):
+        """Detect a supported sample rate for the default input device"""
+        # Try common sample rates in order of preference
+        rates_to_try = [24000, 48000, 44100, 16000, 32000, 22050, 8000]
+
+        for rate in rates_to_try:
+            try:
+                # Try to open a test stream
+                test_stream = self.audio.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=rate,
+                    input=True,
+                    frames_per_buffer=CHUNK,
+                    start=False
+                )
+                test_stream.close()
+                print(f"[AUDIO] Detected supported sample rate: {rate} Hz")
+                return rate
+            except Exception:
+                continue
+
+        # Fallback to 48000 if nothing works
+        print("[AUDIO] No supported rate detected, defaulting to 48000 Hz")
+        return 48000
 
     async def connect(self):
         """Connect to OpenAI Realtime API with automatic reconnection"""
@@ -218,7 +250,7 @@ class RealtimeAudioAssistant:
         self.stream = self.audio.open(
             format=FORMAT,
             channels=CHANNELS,
-            rate=RATE,
+            rate=self.device_rate,
             input=True,
             frames_per_buffer=CHUNK
         )
@@ -226,8 +258,12 @@ class RealtimeAudioAssistant:
         print("Recording... Press Ctrl+C to stop")
         self.is_recording = True
 
-        # Complete silence for when muted
-        silent_audio = b'\x00\x00' * (CHUNK // 2)
+        # Calculate chunk size for target rate
+        target_chunk_size = int(CHUNK * TARGET_RATE / self.device_rate)
+        silent_audio = b'\x00\x00' * (target_chunk_size // 2)
+
+        # Resampling state
+        resampling_state = None
 
         try:
             while self.is_recording:
@@ -237,7 +273,21 @@ class RealtimeAudioAssistant:
                 else:
                     # Only read from microphone when not muted and stream is active
                     if self.stream.is_active():
-                        audio_data = self.stream.read(CHUNK, exception_on_overflow=False)
+                        device_audio = self.stream.read(CHUNK, exception_on_overflow=False)
+
+                        # Resample to 24kHz if needed
+                        if self.device_rate != TARGET_RATE:
+                            resampled, resampling_state = audioop.ratecv(
+                                device_audio,
+                                2,  # sample width (16-bit = 2 bytes)
+                                CHANNELS,
+                                self.device_rate,
+                                TARGET_RATE,
+                                resampling_state
+                            )
+                            audio_data = resampled
+                        else:
+                            audio_data = device_audio
                     else:
                         audio_data = silent_audio
 
@@ -304,12 +354,12 @@ class RealtimeAudioAssistant:
             print("[TTS] Streaming audio in real-time...")
             import subprocess
 
-            # Use mpv for streaming playback
+            # Use mpv for streaming playback with ALSA output
             process = subprocess.Popen(
-                ['mpv', '--no-video', '--no-terminal', '-'],
+                ['mpv', '--no-video', '--no-terminal', '--audio-device=alsa', '--really-quiet', '-'],
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
 
             chunk_count = 0
@@ -318,16 +368,32 @@ class RealtimeAudioAssistant:
                     if chunk:
                         chunk_count += 1
                         print(f"[TTS] Chunk {chunk_count}: {len(chunk)} bytes")
-                        process.stdin.write(chunk)
-                        process.stdin.flush()
+                        try:
+                            process.stdin.write(chunk)
+                            process.stdin.flush()
+                        except BrokenPipeError:
+                            print("[TTS] BrokenPipeError - mpv may have crashed")
+                            stderr = process.stderr.read().decode('utf-8', errors='ignore')
+                            if stderr:
+                                print(f"[TTS] mpv error: {stderr}")
+                            break
 
                 print(f"[TTS] Finished streaming {chunk_count} chunks")
                 process.stdin.close()
                 process.wait()
-                print("[TTS] Playback complete")
+
+                # Check for errors
+                stderr = process.stderr.read().decode('utf-8', errors='ignore')
+                if stderr:
+                    print(f"[TTS] mpv stderr: {stderr}")
+
+                print(f"[TTS] Playback complete (exit code: {process.returncode})")
 
             except BrokenPipeError:
                 print("[TTS] Playback interrupted")
+                stderr = process.stderr.read().decode('utf-8', errors='ignore')
+                if stderr:
+                    print(f"[TTS] mpv error: {stderr}")
             finally:
                 if process.poll() is None:
                     process.terminate()
@@ -336,8 +402,11 @@ class RealtimeAudioAssistant:
             print("[TTS ERROR] mpv not found, falling back to buffered playback")
             # Fallback to mpg123 with full buffering
             try:
+                async def single_text_generator_fallback():
+                    yield text
+
                 audio_stream = self.fish_client.tts.stream_websocket(
-                    single_text_generator(),
+                    single_text_generator_fallback(),
                     reference_id=self.fish_voice_id,
                     config=TTSConfig(format="mp3", latency="balanced", chunk_length=150)
                 )
@@ -354,12 +423,19 @@ class RealtimeAudioAssistant:
                         tmp.write(b''.join(chunks))
                         tmp_path = tmp.name
 
-                    subprocess.run(['mpg123', tmp_path],
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
+                    print(f"[TTS] Playing {len(chunks)} chunks via mpg123")
+                    result = subprocess.run(['mpg123', '--audio-device', 'alsa', tmp_path],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+
+                    if result.returncode != 0:
+                        print(f"[TTS] mpg123 error: {result.stderr.decode('utf-8', errors='ignore')}")
+
                     os.unlink(tmp_path)
             except Exception as e:
+                import traceback
                 print(f"[TTS ERROR] Fallback failed: {e}")
+                traceback.print_exc()
 
         except Exception as e:
             import traceback
