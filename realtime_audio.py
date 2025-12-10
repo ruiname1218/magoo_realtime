@@ -109,14 +109,60 @@ class RealtimeAudioAssistant:
                 )
                 test_stream.close()
                 print(f"[AUDIO] Detected supported sample rate: {rate} Hz")
-                return rate
+
+                # Additional verification: wait a bit and try again
+                import time
+                time.sleep(0.5)
+                try:
+                    verify_stream = self.audio.open(
+                        format=FORMAT,
+                        channels=CHANNELS,
+                        rate=rate,
+                        input=True,
+                        frames_per_buffer=CHUNK,
+                        start=False
+                    )
+                    verify_stream.close()
+                    print(f"[AUDIO] Verified sample rate: {rate} Hz")
+                    return rate
+                except Exception as verify_error:
+                    print(f"[AUDIO] Verification failed for {rate} Hz: {verify_error}")
+                    continue
+
             except Exception as e:
-                print(f"[AUDIO] Rate {rate} failed: {e}")
+                print(f"[AUDIO] Rate {rate} Hz failed: {type(e).__name__}: {str(e)[:100]}")
                 continue
 
-        # Fallback to 48000 if nothing works
-        print("[AUDIO] No supported rate detected, defaulting to 48000 Hz")
-        return 48000
+        # If all rates failed, try to get the device's default rate
+        try:
+            device_info = self.audio.get_default_input_device_info()
+            default_rate = int(device_info.get('defaultSampleRate', 44100))
+            print(f"[AUDIO] All rates failed, trying device default: {default_rate} Hz")
+
+            # Give device more time to stabilize
+            import time
+            time.sleep(2)
+
+            try:
+                test_stream = self.audio.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=default_rate,
+                    input=True,
+                    frames_per_buffer=CHUNK,
+                    start=False
+                )
+                test_stream.close()
+                print(f"[AUDIO] Using device default rate: {default_rate} Hz")
+                return default_rate
+            except Exception as e:
+                print(f"[AUDIO] Device default rate failed: {e}")
+        except Exception as e:
+            print(f"[AUDIO] Could not get device info: {e}")
+
+        # Final fallback
+        print("[AUDIO] ERROR: No sample rate works! Using 44100 Hz as last resort")
+        return 44100
 
     async def connect(self):
         """Connect to OpenAI Realtime API with automatic reconnection"""
@@ -210,6 +256,10 @@ class RealtimeAudioAssistant:
         """Clean response text by removing JSON artifacts and metadata"""
         if not text:
             return ""
+
+        # Pattern 0: Remove everything up to and including ':' at the beginning
+        # Matches patterns like: "response: text" or "answer: text"
+        text = re.sub(r'^[^:]*:\s*', '', text)
 
         # Pattern 1: Remove leading JSON-like metadata (role, content, input_type, response, etc.)
         # Matches patterns like: "role":"assistant","content": or text: or input_type":"voice","confidence":1.0} or response":
